@@ -1,0 +1,22 @@
+# Data and cached results (participant-level -- never commit)
+checkpoints/
+performance/
+figures/
+*.rds
+*.RData
+*.rda
+*.csv
+*.tsv
+*.xlsx
+
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+*_cache/
+*_files/
+*.html
+
+# OS
+.DS_Store
+Thumbs.db

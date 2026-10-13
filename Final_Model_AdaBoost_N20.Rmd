@@ -1,0 +1,942 @@
+---
+title: "Final model: AdaBoost, N = 20"
+date: "`r Sys.Date()`"
+editor_options:
+  chunk_output_type: console
+---
+
+# 0. Setup
+```{r setup}
+options(warn = 1)
+project_dir <- "J:/HCC/20260916_modeling/Final_Model"
+setwd(project_dir)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(phyloseq)
+library(caret)
+library(pROC)
+library(randomForest)
+library(ggplot2)
+library(scales)
+library(MMUPHin)
+library(adabag)
+library(fastshap)
+library(ggbeeswarm)
+
+checkpoint_dir <- file.path(project_dir, "checkpoints")
+if (!dir.exists(checkpoint_dir)) dir.create(checkpoint_dir, recursive = TRUE)
+
+fig_dir  <- file.path(project_dir, "figures")
+perf_dir <- file.path(project_dir, "performance")
+for (d in c(fig_dir, perf_dir)) if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+
+run_or_load <- function(name, expr_fun, force = FALSE) {
+  path <- file.path(checkpoint_dir, paste0(name, ".rds"))
+  if (!force && file.exists(path)) {
+    cat(sprintf("[checkpoint] '%s' <- loaded from cache\n", name)); flush.console()
+    return(readRDS(path))
+  }
+  cat(sprintf("[checkpoint] '%s' <- computing (no cache found, or force=TRUE)...\n", name)); flush.console()
+  t0 <- Sys.time()
+  result <- expr_fun()
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  cat(sprintf("[checkpoint] '%s' done in %.1f sec -- cached to %s\n", name, elapsed, path)); flush.console()
+  saveRDS(result, path)
+  result
+}
+
+theme_report <- theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(color = "grey40", size = 10.5),
+        legend.position = "bottom",
+        legend.title = element_blank()
+        )
+```
+
+# 1. Validation cohorts
+```{r prep_val}
+validation_paths <- list(China_Cohort = list(bac="J:/HCC/valid_data/valid_table/China_cohort_bac.rds",
+                                             fun = "J:/HCC/valid_data/valid_table/China_cohort_fun.rds"),
+                         Thai_Cohort  = list(bac = "J:/HCC/valid_data/valid_table/Thai_cohort_bac.rds",
+                                             fun = "J:/HCC/valid_data/valid_table/Thai_cohort_fun.rds"),
+                         Korea_Cohort = list(bac = "J:/HCC/valid_data/valid_table/Korea_cohort_bac.rds",
+                                             fun = "J:/HCC/valid_data/valid_table/Korea_cohort_fun.rds")
+                         )
+
+merge_bac_fun <- function(ps_bac, ps_fun, cohort_name = "") {
+  sample_data(ps_bac)$..tmp_fix.. <- 1
+  sample_data(ps_fun)$..tmp_fix.. <- 1
+  ps_merged <- phyloseq::merge_phyloseq(ps_bac, ps_fun)
+  sample_data(ps_merged)$..tmp_fix.. <- NULL
+  return(ps_merged)
+}
+
+ps_China_bac <- readRDS(validation_paths$China_Cohort$bac) %>%
+  speedyseq::tax_glom(taxrank = "Species", NArm = FALSE)
+ps_China_fun <- readRDS(validation_paths$China_Cohort$fun) %>%
+  speedyseq::tax_glom(taxrank = "Species", NArm = FALSE)
+ps_Thai_bac  <- readRDS(validation_paths$Thai_Cohort$bac)  %>%
+  speedyseq::tax_glom(taxrank = "Species", NArm = FALSE)
+ps_Thai_fun  <- readRDS(validation_paths$Thai_Cohort$fun)  %>%
+  speedyseq::tax_glom(taxrank = "Species", NArm = FALSE)
+ps_Korea_bac <- readRDS(validation_paths$Korea_Cohort$bac) %>%
+  speedyseq::tax_glom(taxrank = "Species", NArm = FALSE)
+ps_Korea_fun <- readRDS(validation_paths$Korea_Cohort$fun) %>%
+  speedyseq::tax_glom(taxrank = "Species", NArm = FALSE)
+
+ps_China_bacfun <- merge_bac_fun(ps_China_bac, ps_China_fun, "China_Cohort")
+ps_Thai_bacfun  <- merge_bac_fun(ps_Thai_bac,  ps_Thai_fun,  "Thai_Cohort")
+ps_Korea_bacfun <- merge_bac_fun(ps_Korea_bac, ps_Korea_fun, "Korea_Cohort")
+```
+
+# 2. Discovery data
+```{r dis_data}
+prep_data <- function() {
+  kmer_bac_phylo <- readRDS("J:/HCC/data/kmer_bac_phylo2.rds")
+  kmer_fun_phylo <- readRDS("J:/HCC/data/kmer_fun_phylo2.rds")
+  ps_bac <- kmer_bac_phylo %>% speedyseq::tax_glom(taxrank = "Species", NArm = FALSE)
+  ps_fun <- kmer_fun_phylo %>% speedyseq::tax_glom(taxrank = "Species", NArm = FALSE)
+
+  tmp1 <- read.csv("J:/HCC/data/metadata.csv", sep = ",")
+  mdata <- tmp1 %>% dplyr::select(c("SampleID", "Group", "Batch")) %>% tibble::column_to_rownames("SampleID")
+  sample_data(ps_bac) <- sample_data(mdata)
+  sample_data(ps_fun) <- sample_data(mdata)
+  list(mdata = mdata, ps_bac = ps_bac, ps_fun = ps_fun)
+}
+
+prepped <- run_or_load("data_prep", prep_data)
+mdata   <- prepped$mdata
+ps_bac  <- prepped$ps_bac
+ps_fun  <- prepped$ps_fun
+
+# filter low pervalence
+filter_prevalence <- function(phylo, min_prevalence = 0.10, kingdom = "bac") {
+  otu <- as(otu_table(phylo), "matrix")
+  if (!taxa_are_rows(phylo)) otu <- t(otu)
+  prevalence <- rowMeans(otu > 0)
+  keep <- prevalence >= min_prevalence
+  cat(sprintf("[%s] Prevalence filter (>=%.0f%%): keeping %d / %d taxa\n",
+              kingdom, min_prevalence * 100, sum(keep), length(keep)))
+  prune_taxa(names(prevalence)[keep], phylo)
+}
+
+filtered <- run_or_load("data_filtered_10pct", function() {
+  ps_bac_f    <- filter_prevalence(ps_bac, 0.10, "bac")
+  ps_fun_f    <- filter_prevalence(ps_fun, 0.10, "fun")
+  ps_bacfun_f <- merge_phyloseq(ps_bac_f, ps_fun_f)
+  list(ps_bac = ps_bac_f, ps_fun = ps_fun_f, ps_bacfun = ps_bacfun_f)
+})
+
+ps_bac    <- filtered$ps_bac
+ps_fun    <- filtered$ps_fun
+ps_bacfun <- filtered$ps_bacfun
+
+# batch correction
+batch_correct <- function(phylo, kingdom = "bac") {
+  cat(sprintf("[%s] MMUPHin input: %d taxa x %d samples\n", kingdom, ntaxa(phylo), nsamples(phylo)))
+  phylo_rel <- microbiome::transform(phylo, "compositional")
+  otu_rel <- as.matrix(otu_table(phylo_rel))
+  mdata_local <- mdata[colnames(otu_rel), , drop = FALSE]
+  sample_data(phylo_rel) <- sample_data(mdata_local)
+  mmuphin_res <- adjust_batch(feature_abd = otu_rel, batch = "Batch", covariates = "Group", data = mdata_local)
+  cat(sprintf("[%s] Features into MMUPHin: %d | out: %d\n",
+              kingdom, nrow(otu_rel), nrow(mmuphin_res$feature_abd_adj)))
+
+  phylo_mmuphin <- prune_taxa(rownames(mmuphin_res$feature_abd_adj), phylo_rel)
+  otu_table(phylo_mmuphin) <- otu_table(mmuphin_res$feature_abd_adj, taxa_are_rows = TRUE)
+  phylo_mmuphin
+}
+
+ps_bac_mmuphin    <- run_or_load("ps_bac_mmuphin_10pct",    function() batch_correct(ps_bac, "bac"))
+ps_fun_mmuphin    <- run_or_load("ps_fun_mmuphin_10pct",    function() batch_correct(ps_fun, "fun"))
+ps_bacfun_mmuphin <- run_or_load("ps_bacfun_mmuphin_10pct", function() batch_correct(ps_bacfun, "bacfun"))
+
+# taxonomy dictionary
+build_taxonomy_lookup <- function(ps) {
+  tax_df <- as.data.frame(tax_table(ps))
+  tax_df$Feature <- rownames(tax_df)
+  rownames(tax_df) <- NULL
+  tax_df %>% dplyr::select(Feature, dplyr::everything())
+}
+
+taxonomy_lookup <- list(
+  bac    = build_taxonomy_lookup(ps_bac_mmuphin),
+  fun    = build_taxonomy_lookup(ps_fun_mmuphin),
+  bacfun = build_taxonomy_lookup(ps_bacfun_mmuphin)
+)
+
+annotate_with_taxonomy <- function(df) {
+  if (!"Dataset" %in% colnames(df) || nrow(df) == 0) return(df)
+  do.call(rbind, lapply(unique(df$Dataset), function(k) {
+    sub <- df[df$Dataset == k, , drop = FALSE]
+    lookup <- taxonomy_lookup[[as.character(k)]]
+    if (is.null(lookup)) return(sub)
+    dplyr::left_join(sub, lookup, by = "Feature")
+  }))
+}
+```
+
+# 3. Prep Validation
+```{r validation_helpers}
+align_and_transform <- function(ps_valid, ps_discovery, transform_method,
+                                kingdom="bac", cohort_name="China_Cohort", match_rank="Species") {
+  disc_tax <- as.data.frame(tax_table(ps_discovery))
+  val_tax <- as.data.frame(tax_table(ps_valid))
+
+  disc_map <- data.frame(discovery_taxon = rownames(disc_tax),
+                         species = as.character(disc_tax[[match_rank]]), stringsAsFactors = FALSE) %>%
+    filter(!is.na(species) & species != "") %>%
+    distinct(species, .keep_all = TRUE)
+
+  val_map <- data.frame(validation_taxon = rownames(val_tax),
+                        species = as.character(val_tax[[match_rank]]), stringsAsFactors = FALSE) %>%
+    filter(!is.na(species) & species != "") %>%
+    distinct(species, .keep_all = TRUE)
+
+  discovery_taxa <- taxa_names(ps_discovery)
+
+  map_df <- data.frame(discovery_taxon = discovery_taxa, stringsAsFactors = FALSE) %>%
+    dplyr::left_join(disc_map, by = "discovery_taxon") %>%
+    dplyr::left_join(val_map, by = "species")
+
+  has_match <- !is.na(map_df$validation_taxon)
+
+  cat(sprintf("[%s/%s] %d / %d discovery taxa matched (%.1f%%)\n", kingdom, cohort_name,
+              sum(has_match), length(discovery_taxa), 100 * sum(has_match) / length(discovery_taxa)))
+
+  ps_valid_t <- microbiome::transform(ps_valid, transform_method)
+  val_t <- as(otu_table(ps_valid_t), "matrix")
+  if (!taxa_are_rows(ps_valid_t)) val_t <- t(val_t)
+
+  padded <- matrix(0, nrow=length(discovery_taxa), ncol = ncol(val_t),
+                   dimnames = list(discovery_taxa, colnames(val_t)))
+  padded[map_df$discovery_taxon[has_match], ] <- val_t[map_df$validation_taxon[has_match], , drop=FALSE]
+
+  list(X=as.data.frame(t(padded)), match_rate=sum(has_match)/length(discovery_taxa))
+}
+
+build_validation_list <- function(kingdom, ps_discovery, transform_method) {
+  objs <- switch(kingdom,
+    bac    = list(China_Cohort=ps_China_bac,    Thai_Cohort=ps_Thai_bac,    Korea_Cohort=ps_Korea_bac),
+    fun    = list(China_Cohort=ps_China_fun,    Thai_Cohort=ps_Thai_fun,    Korea_Cohort=ps_Korea_fun),
+    bacfun = list(China_Cohort=ps_China_bacfun, Thai_Cohort=ps_Thai_bacfun, Korea_Cohort=ps_Korea_bacfun)
+    )
+
+  out <- list()
+  for (nm in names(objs)) {
+    aligned <- align_and_transform(objs[[nm]], ps_discovery, transform_method, kingdom, nm)
+    meta <- as(sample_data(objs[[nm]]), "data.frame")
+    y <- factor(meta[rownames(aligned$X), "Group"], levels = c("HCC", "CO"))
+    out[[nm]] <- list(X = aligned$X, y = y, match_rate = aligned$match_rate)
+  }
+  out
+}
+```
+
+# 4. Feature selection: Adaboost
+```{r}
+select_adaboost <- function(trainX, trainY, seed = 1, nIter = 50) {
+  set.seed(seed)
+  all_features <- colnames(trainX)
+
+  ctrl <- trainControl(method = "none")
+  tune_grid <- data.frame(mfinal = nIter, maxdepth = 1, coeflearn = "Breiman")
+  fit <- train(x = trainX, y = trainY, method = "AdaBoost.M1", trControl = ctrl, tuneGrid = tune_grid)
+
+  ada_model <- fit$finalModel
+  imp <- ada_model$importance
+
+  if (is.null(imp) || length(imp) == 0) {
+    stop("select_adaboost(): unable to extract 'importance' from adabag model -- ")
+  }
+  if (!all(names(imp) %in% all_features)) {
+    stop("select_adaboost(): adabag importance names do not match trainX column names -- ",
+         "likely make.names() sanitizing non-syntactic feature names inside caret's formula ",
+         "interface. Mismatched names: ",
+         paste(setdiff(names(imp), all_features), collapse = ", "))
+  }
+
+  imp_acc <- setNames(numeric(length(all_features)), all_features)
+  imp_acc[names(imp)] <- imp
+
+  data.frame(Feature = names(imp_acc), Importance = as.numeric(imp_acc), row.names = NULL) %>%
+    dplyr::arrange(dplyr::desc(Importance))
+}
+```
+
+# 5. Training function
+```{r training_function}
+run_training <- function(ps, kingdom="bac", group_var="Group", group_levels=c("HCC", "CO"), positive_class="HCC",
+                         n_features = 20, n_repeats = 20,
+                         cv_folds = 5, cv_repeats = 20,
+                         validation_list = list()
+                         ) {
+
+  cat(sprintf("[%s / Adaboost] ntaxa: %d | N_Features = %d | repeats = %d\n",
+              kingdom, ntaxa(ps), n_features, n_repeats))
+
+  mdata_ps <- as(sample_data(ps), "data.frame")
+  otu <- if (taxa_are_rows(ps)) as.data.frame(t(as(otu_table(ps), "matrix")))
+  else as.data.frame(as(otu_table(ps), "matrix"))
+
+  df1 <- merge(otu, mdata_ps[, group_var, drop = FALSE], by = "row.names") %>%
+    tibble::column_to_rownames("Row.names")
+
+  colnames(df1)[colnames(df1) == group_var] <- "Group"
+  df1$Group <- factor(df1$Group, levels = group_levels)
+  X <- df1 %>% dplyr::select(-Group)
+  y <- df1$Group
+
+  other_class <- setdiff(group_levels, positive_class)
+  resultsList <- list()
+  featureList <- list()
+  predList    <- list()
+
+  for (i in seq_len(n_repeats)) {
+    message("[", kingdom, "/Adaboost] Repeat ", i, " / ", n_repeats)
+    flush.console()
+
+    set.seed(i + 100)
+    inTrain <- createDataPartition(y, p = 0.8, list = FALSE)
+    trainX <- X[inTrain, , drop = FALSE]; trainY <- y[inTrain]
+    testX  <- X[-inTrain, , drop = FALSE]; testY  <- y[-inTrain]
+
+    set.seed(20 + i)
+    train_down <- downSample(x = trainX, y = trainY, list = FALSE, yname = "Group")
+    trainX_bal <- train_down %>% dplyr::select(-Group)
+    trainY_bal <- train_down$Group
+
+    nzv_bal_idx <- nearZeroVar(trainX_bal)
+    if (length(nzv_bal_idx) > 0) {
+      message(" [check] ", length(nzv_bal_idx),
+              " feature(s) became near-zero-variance after downsampling--removing")
+      trainX_bal <- trainX_bal[, -nzv_bal_idx, drop = FALSE]
+    }
+
+    imp_df <- select_adaboost(trainX_bal, trainY_bal, seed = 30 + i)
+
+    max_avail <- nrow(imp_df)
+    nf_use <- min(n_features, max_avail)
+    if (nf_use < n_features)
+      message(" Requested n_features=", n_features, " but only ", max_avail, " available; using ", nf_use)
+
+    selected_features <- imp_df$Feature[seq_len(nf_use)]
+
+    featureList[[i]] <- data.frame(
+      Dataset = kingdom, FeatureMethod = "Adaboost", N_Features = nf_use,
+      Repeat = i, Feature = selected_features,
+      Importance = imp_df$Importance[seq_len(nf_use)]
+    )
+
+    set.seed(1000 + i * 100 + n_features)
+    ctrl <- trainControl(method = "repeatedcv", number = cv_folds, repeats = cv_repeats, classProbs = TRUE,
+                          summaryFunction = twoClassSummary, savePredictions = "final")
+
+    final_model <- train(x = trainX_bal[, selected_features, drop = FALSE], y = trainY_bal,
+                         method = "rf", trControl = ctrl, metric = "ROC",
+                         tuneLength = 5, preProcess = c("center", "scale"))
+
+    testX_sel <- testX[, selected_features, drop = FALSE]
+    probs <- predict(final_model, newdata=testX_sel, type="prob")[, positive_class]
+    preds <- predict(final_model, newdata=testX_sel)
+    cmatrix <- confusionMatrix(preds, testY, positive = positive_class)
+    roc_val <- roc(testY, probs, quiet=TRUE, levels=rev(group_levels), direction="<")
+
+    tbl <- cmatrix$table
+    TP <- tbl[positive_class, positive_class]; FP <- tbl[positive_class, other_class]
+    FN <- tbl[other_class, positive_class];    TN <- tbl[other_class, other_class]
+
+    resultsList[[length(resultsList) +1]] <- data.frame(Dataset=kingdom,
+                                                        FeatureMethod="Adaboost",
+                                                        Repeat=i,
+                                                        N_Features=nf_use,
+                                                        Split="Hold-out test set",
+                                                        AUC=as.numeric(roc_val$auc),
+                                                        Acc=cmatrix$overall[["Accuracy"]],
+                                                        Sens=cmatrix$byClass[["Sensitivity"]],
+                                                        Spec=cmatrix$byClass[["Specificity"]],
+                                                        F1=cmatrix$byClass[["F1"]]
+                                                        )
+
+    predList[[length(predList) + 1]] <- data.frame(
+      Dataset = kingdom, FeatureMethod = "Adaboost", Repeat = i, N_Features = nf_use,
+      Split = "Hold-out test set", SampleID = rownames(testX_sel),
+      obs = as.character(testY), prob = as.numeric(probs), row.names = NULL
+    )
+
+    for (val_name in names(validation_list)) {
+      val_data <- validation_list[[val_name]]
+      missing_cols <- setdiff(selected_features, colnames(val_data$X))
+      if(length(missing_cols) >0) {
+        warning(sprintf("[%s/%s] %d selected feature(s) unexpectedly missing--filling with 0...",
+                        kingdom, val_name, length(missing_cols)))
+        for (mc in missing_cols) val_data$X[[mc]] <- 0
+      }
+
+      val_X_sel <- val_data$X[, selected_features, drop=FALSE]
+      val_probs <- predict(final_model, newdata=val_X_sel, type="prob")[, positive_class]
+      val_preds <- predict(final_model, newdata=val_X_sel)
+      val_cm <- confusionMatrix(val_preds, val_data$y, positive=positive_class)
+      val_roc <- roc(val_data$y, val_probs, quiet=TRUE, levels=rev(group_levels), direction="<")
+      val_tbl <- val_cm$table
+      vTP <- val_tbl[positive_class, positive_class]; vFP <- val_tbl[positive_class, other_class]
+      vFN <- val_tbl[other_class, positive_class];    vTN <- val_tbl[other_class, other_class]
+
+      resultsList[[length(resultsList) +1]] <- data.frame(Dataset=kingdom,
+                                                          FeatureMethod="Adaboost",
+                                                          Repeat=i,
+                                                          N_Features=nf_use,
+                                                          Split=val_name,
+                                                          AUC=as.numeric(val_roc$auc),
+                                                          Acc=val_cm$overall[["Accuracy"]],
+                                                          Sens=val_cm$byClass[["Sensitivity"]],
+                                                          Spec=val_cm$byClass[["Specificity"]],
+                                                          F1=val_cm$byClass[["F1"]]
+                                                          )
+
+      predList[[length(predList) + 1]] <- data.frame(
+        Dataset = kingdom, FeatureMethod = "Adaboost", Repeat = i, N_Features = nf_use,
+        Split = val_name, SampleID = rownames(val_X_sel),
+        obs = as.character(val_data$y), prob = as.numeric(val_probs), row.names = NULL
+      )
+      }
+  }
+
+  list(kingdom=kingdom, feature_selection="Adaboost",
+       results=do.call(rbind, resultsList),
+       features=do.call(rbind, featureList),
+       predictions=do.call(rbind, predList)
+       )
+}
+```
+
+# 6. Running
+```{r running}
+kingdoms <- list(bac=ps_bac_mmuphin, fun=ps_fun_mmuphin, bacfun=ps_bacfun_mmuphin)
+
+all_final_results      <- list()
+all_feature_records    <- list()
+all_prediction_records <- list()
+validation_lists       <- list()
+failed_combos <- character(0)
+
+for (kname in names(kingdoms)) {
+  ps <- kingdoms[[kname]]
+
+  val_list <- tryCatch(build_validation_list(kname, ps, "compositional"),
+                       error=function(e) {
+                         message(sprintf("[FAILED] build_validation_list for kingdom '%s' -- %s.
+                                         Skipping this kingdom.", kname, conditionMessage(e)))
+                         failed_combos <<- c(failed_combos, sprintf("%s/ALL (validation_list build failed)",
+                                                                    kname))
+                         NULL
+                         }
+                       )
+  if (is.null(val_list)) next
+  validation_lists[[kname]] <- val_list
+
+  ckpt_name <- sprintf("%s_mmuphin_adaboost_n20_final", kname)
+
+  res <- tryCatch(run_or_load(ckpt_name, function() {
+    run_training(ps, kingdom = kname, n_features = 20, n_repeats = 20, validation_list = val_list)
+  }),
+  error = function(e) {message(sprintf("[FAILED] %s/adaboost/N20 -- %s.", kname, conditionMessage(e)))
+    failed_combos <<- c(failed_combos, sprintf("%s/adaboost/N20", kname))
+    NULL
+    }
+  )
+  if (is.null(res)) next
+
+  all_final_results[[kname]]      <- res$results
+  all_feature_records[[kname]]    <- res$features
+  all_prediction_records[[kname]] <- res$predictions
+}
+
+if (length(failed_combos) > 0) {
+  cat("\n== WARNING: the following combinations failed and were skipped ==\n")
+  cat(paste(" -", failed_combos), sep = "\n")
+} else {
+  cat("\nAll completed successfully.\n")
+}
+
+all_results <- do.call(rbind, all_final_results)
+all_results$Split <- factor(all_results$Split, 
+                            levels = c("Hold-out test set", "China_Cohort", "Thai_Cohort", "Korea_Cohort"))
+
+all_results$Dataset <- factor(all_results$Dataset, levels = c("bac", "fun", "bacfun"))
+
+all_features <- do.call(rbind, all_feature_records)
+n_repeats_used <- max(all_features$Repeat)
+cat(sprintf("n_repeats detected from the data: %d\n", n_repeats_used))
+
+write.csv(all_results, file.path(perf_dir, "full_results.csv"), row.names = FALSE)
+
+all_predictions <- do.call(rbind, all_prediction_records)
+all_predictions$Split <- factor(all_predictions$Split,
+                                levels = c("Hold-out test set", "China_Cohort", "Thai_Cohort", "Korea_Cohort"))
+all_predictions$Dataset <- factor(all_predictions$Dataset, levels = c("bac", "fun", "bacfun"))
+all_predictions$obs <- factor(all_predictions$obs, levels = c("HCC", "CO"))
+write.csv(all_predictions, file.path(perf_dir, "raw_predictions_for_roc.csv"), row.names = FALSE)
+```
+
+# 7. Performance summary (AUC, Acc, Sens, Spec, F1 -- no MCC)
+```{r combined_results}
+summary_final <- all_results %>%
+  dplyr::group_by(Dataset, Split) %>%
+  dplyr::summarise(n_repeats=dplyr::n(),
+                   mean_AUC = mean(AUC), sd_AUC = sd(AUC), se_AUC = sd(AUC) / sqrt(dplyr::n()),
+                   mean_Acc = mean(Acc), sd_Acc = sd(Acc), se_Acc = sd(Acc) / sqrt(dplyr::n()),
+                   mean_Sens = mean(Sens), sd_Sens = sd(Sens), se_Sens = sd(Sens) / sqrt(dplyr::n()),
+                   mean_Spec = mean(Spec), sd_Spec = sd(Spec), se_Spec = sd(Spec) / sqrt(dplyr::n()),
+                   mean_F1 = mean(F1), sd_F1 = sd(F1), se_F1 = sd(F1) / sqrt(dplyr::n()),
+                   .groups = "drop") %>%
+  dplyr::mutate(ci95_AUC_lo = mean_AUC - qt(0.975, df = n_repeats - 1) * se_AUC,
+                ci95_AUC_hi = mean_AUC + qt(0.975, df = n_repeats - 1) * se_AUC)
+
+cat("\n=== Summary: mean AUC / Acc / Sens / Spec / F1 (t-based 95% CI) ===\n")
+print(as.data.frame(summary_final))
+write.csv(summary_final, file.path(perf_dir, "summary.csv"), row.names = FALSE)
+
+SPLIT_COLOR <- c("Hold-out test set" = "#0072B2", "China Cohort" = "#D55E00",
+                 "Korea Cohort" = "#009E73", "Thai Cohort" = "#CC79A7")
+
+metrics_long <- all_results %>%
+  tidyr::pivot_longer(cols = c(AUC, Acc, Sens, Spec, F1), names_to = "Metric", values_to = "value") %>%
+  dplyr::group_by(Dataset, Split, Metric) %>%
+  dplyr::summarise(n_repeats = sum(!is.na(value)), mean_value = mean(value, na.rm = TRUE),
+                   sd_value = sd(value, na.rm = TRUE), se_value = sd_value / sqrt(n_repeats), .groups = "drop") %>%
+  dplyr::mutate(ci95_lo = mean_value - qt(0.975, df = n_repeats - 1) * se_value,
+                ci95_hi = mean_value + qt(0.975, df = n_repeats - 1) * se_value,
+                Metric = factor(Metric, levels = c("AUC", "F1", "Acc", "Sens", "Spec")),
+                Split = factor(Split, levels = c("Hold-out test set", "China_Cohort", 
+                                                 "Korea_Cohort", "Thai_Cohort"),
+                              labels = c("Hold-out test set", "China Cohort", 
+                                         "Korea Cohort", "Thai Cohort")),
+                Dataset = factor(Dataset, levels = c("bac", "fun", "bacfun"),
+                                 labels = c("Bacteria", "Fungi", "Bac + Fun")))
+
+p_metrics <- metrics_long %>%
+  ggplot(aes(x = Metric, y = mean_value, fill = Split)) +
+  geom_col(width = 0.5, color = "darkgrey") +
+  geom_errorbar(aes(ymin = ci95_lo, ymax = ci95_hi), width = 0.2, color = "black", linewidth = 0.4) +
+  geom_text(aes(y = pmin(ci95_hi + 0.05, 1.03), label = sprintf("%.2f", mean_value)), size = 3) +
+  facet_grid(Dataset ~ Split) +
+  scale_fill_manual(values = SPLIT_COLOR) +
+  coord_cartesian(ylim = c(0, 1.05)) +
+  labs(#title = "Final model performance -- Adaboost, N=20",
+       #subtitle = "Comparison across external cohorts and kingdom datasets",
+       x = NULL, y = "Score") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray30", size = 11),
+        legend.position = "none",
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "#EFEFEF", color = "gray60"),
+        strip.text = element_text(face = "bold", size = 11),
+        axis.text.x = element_text(face = "bold"))
+
+print(p_metrics)
+ggsave(file.path(fig_dir, "performance_summary.png"), p_metrics, width = 10, height = 6.5, dpi = 800)
+
+saveRDS(p_metrics, "J:/HCC/hcc_manuscript/figure_collection/prediction_full_metrics.rds")
+```
+
+
+# 9. ROC curves
+```{r roc_curves}
+# Compute mean ROC for each pair-dataset
+compute_mean_roc <- function(df, group_cols = c("Dataset", "Split"), fpr_grid = seq(0, 1, by = 0.01)) {
+  groups <- df %>% dplyr::distinct(dplyr::across(dplyr::all_of(group_cols)))
+  out <- vector("list", nrow(groups))
+
+  for (g in seq_len(nrow(groups))) {
+    sub <- dplyr::inner_join(df, groups[g, , drop = FALSE], by = group_cols)
+    repeats <- sort(unique(sub$Repeat))
+    tpr_mat <- matrix(NA_real_, nrow = length(repeats), ncol = length(fpr_grid))
+    auc_vec <- rep(NA_real_, length(repeats))
+
+    for (i in seq_along(repeats)) {
+      sr <- sub %>% dplyr::filter(Repeat == repeats[i])
+      if (length(unique(sr$obs)) < 2 || nrow(sr) < 3) next
+
+      roc_r <- tryCatch(pROC::roc(sr$obs, sr$prob, quiet = TRUE, levels = rev(c("HCC", "CO")), direction = "<"),
+                        error = function(e) NULL)
+      if (is.null(roc_r)) next
+
+      auc_vec[i] <- as.numeric(roc_r$auc)
+      fpr_r <- 1 - roc_r$specificities
+      tpr_r <- roc_r$sensitivities
+      ord <- order(fpr_r)
+      tpr_mat[i, ] <- approx(fpr_r[ord], tpr_r[ord], xout = fpr_grid, ties = mean)$y
+    }
+
+    mean_tpr <- colMeans(tpr_mat, na.rm = TRUE)
+    se_tpr   <- apply(tpr_mat, 2, function(x) sd(x, na.rm = TRUE) / sqrt(sum(!is.na(x))))
+
+    out[[g]] <- data.frame(groups[g, , drop = FALSE], FPR = fpr_grid, mean_TPR = mean_tpr, se_TPR = se_tpr,
+                           mean_AUC = mean(auc_vec, na.rm = TRUE), n_repeats_total = sum(!is.na(auc_vec)))
+  }
+  do.call(rbind, out)
+}
+
+mean_roc_df <- compute_mean_roc(all_predictions)
+
+roc_check <- mean_roc_df %>%
+  dplyr::distinct(Dataset, Split, mean_AUC) %>%
+  dplyr::left_join(summary_final %>% dplyr::select(Dataset, Split, mean_AUC_summary = mean_AUC),
+                   by = c("Dataset", "Split")) %>%
+  dplyr::mutate(diff = abs(mean_AUC - mean_AUC_summary))
+
+if (any(roc_check$diff > 0.01, na.rm = TRUE))
+  warning("ROC-derived mean_AUC disagrees with summary_final by > 0.01 for at least one group -- check compute_mean_roc().")
+
+cat("\n=== ROC mean_AUC vs. summary_final mean_AUC (consistency check) ===\n")
+print(as.data.frame(roc_check))
+
+write.csv(mean_roc_df, file.path(perf_dir, "mean_roc_curves.csv"), row.names = FALSE)
+
+# Plot ROC Curve
+roc_plot_df <- mean_roc_df %>%
+  dplyr::mutate(Split_disp = factor(Split, levels = c("Hold-out test set", "China_Cohort", "Korea_Cohort", 
+                                                      "Thai_Cohort"),
+                                    labels = c("Hold-out test set", "China Cohort", "Korea Cohort", 
+                                               "Thai Cohort")),
+                Dataset_disp = factor(Dataset, levels = c("bac", "fun", "bacfun"),
+                                      labels = c("Bacteria", "Fungi", "Bac + Fun")))
+
+ROC_SPLIT_COLOR <- c("Hold-out test set" = "#0072B2", "China Cohort" = "#D55E00",
+                     "Thai Cohort" = "#CC79A7", "Korea Cohort" = "#009E73")
+
+auc_labels <- roc_plot_df %>%
+  dplyr::distinct(Dataset_disp, Split_disp, mean_AUC) %>%
+  dplyr::group_by(Dataset_disp) %>%
+  dplyr::arrange(Split_disp, .by_group = TRUE) %>%
+  dplyr::mutate(y_pos = 0.25 - 0.08 * (dplyr::row_number() - 1), 
+                label = sprintf("%s: %.2f", Split_disp, mean_AUC)) %>%
+  dplyr::ungroup()
+
+p_roc <- ggplot(roc_plot_df, aes(x = FPR, y = mean_TPR, color = Split_disp, fill = Split_disp)) +
+  geom_ribbon(aes(ymin = pmax(mean_TPR - 1.96 * se_TPR, 0), ymax = pmin(mean_TPR + 1.96 * se_TPR, 1)),
+              alpha = 0.12, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_text(data = auc_labels, aes(x = 0.5, y = y_pos, label = label, color = Split_disp),
+            hjust = 0, size = 3.5, inherit.aes = FALSE, show.legend = FALSE) +
+  facet_wrap(~ Dataset_disp) +
+  scale_color_manual(values = ROC_SPLIT_COLOR) +
+  scale_fill_manual(values = ROC_SPLIT_COLOR) +
+  coord_equal() +
+  labs(#title = "Mean ROC curves -- Adaboost, N=20",
+       #subtitle = "Vertically-averaged across 20 repeats; ribbon = +/-1.96 SE across repeats",
+       x = "FPR (1 - Specificity)", y = "TPR (Sensitivity)",
+       color = "Validation cohort", fill  = "Validation cohort") +
+  theme_bw() +
+  theme(strip.text = element_text(face = "bold", size = 10))
+
+print(p_roc)
+
+# ggsave(file.path(fig_dir, "ROC_curves.png"), p_roc, width = 12, height = 5, dpi = 600)
+# saveRDS(p_roc, "J:/HCC/hcc_manuscript/figure_collection/roc_curves.rds")
+```
+
+# 10. Feature importance / selection frequency
+```{r feature_frequency}
+# compute feature frequence
+feature_freq <- all_features %>%
+  dplyr::group_by(Dataset, Feature) %>%
+  dplyr::summarise(times_selected = dplyr::n(),
+                   frequency = dplyr::n() / n_repeats_used,
+                   mean_importance = mean(Importance),
+                   .groups = "drop") %>%
+  dplyr::arrange(Dataset, dplyr::desc(frequency), dplyr::desc(mean_importance)) %>%
+  annotate_with_taxonomy()
+
+write.csv(feature_freq, file.path(perf_dir, "feature_frequency_summary.csv"), row.names = FALSE)
+
+# Plot
+reorder_within <- function(x, by, within, sep = "___") {
+  new_x <- paste(x, within, sep = sep)
+  stats::reorder(new_x, by)
+}
+scale_x_reordered <- function(..., sep = "___") {
+  ggplot2::scale_x_discrete(labels = function(x) sub(paste0(sep, ".*$"), "", x), ...)
+}
+
+TOP_N_DISPLAY <- 20
+
+feature_freq_plot_df <- feature_freq %>%
+  dplyr::mutate(Species_clean = gsub("^[a-z]__", "", Species)) %>%
+  dplyr::group_by(Dataset) %>%
+  dplyr::slice_max(order_by = frequency, n = TOP_N_DISPLAY, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(Dataset_disp = factor(Dataset, levels = c("bac", "fun", "bacfun"),
+                                      labels = c("Bacteria", "Fungi", "Bac + Fun")))
+
+p_freq <- feature_freq_plot_df %>%
+  ggplot(aes(x = reorder_within(Species_clean, frequency, Dataset), y = frequency, fill = mean_importance)) +
+  geom_col(width=0.5) +
+  coord_flip() +
+  scale_x_reordered() +
+  facet_wrap(~ Dataset_disp, scales = "free_y") +
+  scale_fill_viridis_c(name = "Importance", direction = -1, c("Low", "Medium", "High")) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(#title = "Feature importance -- selection frequency (Adaboost, N=20)",
+       #subtitle = "Fraction of 20 repeats in which each feature was selected",
+       x = NULL, y = "Selection frequency") +
+  theme_report + theme(axis.text.y = element_text(size = 10),
+                       axis.text.x = element_text(size = 10), 
+                       legend.position = "right",
+                       legend.title = element_text(size = 11))
+
+print(p_freq)
+
+# ggsave(file.path(fig_dir, "feature_frequency.png"), p_freq, width = 12, height = 6, dpi = 600)
+# saveRDS(p_freq, "J:/HCC/hcc_manuscript/figure_collection/feature_frequency_top_20.rds")
+```
+
+## Fig 6
+```{r}
+library(ggpubr)
+library(tidytext)
+
+f6 <- ggarrange(p_roc, p_freq, ncol = 1, nrow = 2, labels = c("A", "B"), common.legend = FALSE, 
+                heights = c(0.9, 1))
+ 
+print(f6)
+
+ggsave(file.path(fig_dir,"fig6.pdf"), f6, width = 12, height = 8)
+ggsave(file.path(fig_dir,"fig6.png"), f6, width = 12, height = 8, dpi=600, bg="white")
+```
+
+
+# 11. Final model refit (consensus top-20 features, full discovery data)
+- this model was used to compute SHAP explanation 
+- fit the discovery data using top-20 importance features (frequency & mean importance)
+- explain on validation datasets
+
+```{r refit_final_model}
+get_discovery_XY <- function(ps, group_var = "Group", group_levels = c("HCC", "CO")) {
+  mdata_ps <- as(sample_data(ps), "data.frame")
+  otu <- if (taxa_are_rows(ps)) as.data.frame(t(as(otu_table(ps), "matrix")))
+  else as.data.frame(as(otu_table(ps), "matrix"))
+  df1 <- merge(otu, mdata_ps[, group_var, drop = FALSE], by = "row.names") %>%
+    tibble::column_to_rownames("Row.names")
+  colnames(df1)[colnames(df1) == group_var] <- "Group"
+  df1$Group <- factor(df1$Group, levels = group_levels)
+  list(X = df1 %>% dplyr::select(-Group), y = df1$Group)
+}
+
+get_consensus_features <- function(feature_freq, kingdom, n = 20) {
+  feature_freq %>%
+    dplyr::filter(Dataset == kingdom) %>%
+    dplyr::arrange(dplyr::desc(frequency), dplyr::desc(mean_importance)) %>%
+    dplyr::slice_head(n = n) %>%
+    dplyr::pull(Feature)
+}
+
+refit_final_model <- function(kingdom, ps, consensus_features, seed = 2026) {
+  
+  xy <- get_discovery_XY(ps)
+  
+  set.seed(seed)
+  down <- downSample(x = xy$X, y = xy$y, list = FALSE, yname = "Group")
+  trainX_bal <- down %>% dplyr::select(-Group)
+  trainY_bal <- down$Group
+  
+  trainX_sel <- trainX_bal[, consensus_features, drop = FALSE]
+
+  ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 20, classProbs = TRUE,
+                       summaryFunction = twoClassSummary, savePredictions = "final")
+ 
+  set.seed(seed)
+  model <- train(x = trainX_sel, y = trainY_bal, method = "rf", trControl = ctrl,
+                metric = "ROC", tuneLength = 5, preProcess = c("center", "scale"))
+  
+  list(model = model, trainX_sel = trainX_sel, trainY_bal = trainY_bal)
+}
+
+consensus_features_list <- setNames(
+  lapply(names(kingdoms), function(k) get_consensus_features(feature_freq, k)),
+  names(kingdoms)
+)
+
+pred_wrapper <- function(object, newdata) predict(object, newdata = newdata, type = "prob")[, "HCC"]
+
+refit_models <- list()
+for (kname in names(kingdoms)) {
+  ckpt_name <- sprintf("%s_refit_final_n20", kname)
+  refit_models[[kname]] <- run_or_load(ckpt_name, function() {
+    refit_final_model(kname, kingdoms[[kname]], consensus_features_list[[kname]])
+  })
+}
+```
+
+# 12. SHAP explanation
+```{r shap_compute}
+SHAP_NSIM <- 500   # Monte Carlo permutations per fastshap::explain() call; higher = less noisy, slower
+
+build_species_labels <- function(kingdom, features) {
+  taxonomy_lookup[[kingdom]] %>%
+    dplyr::filter(Feature %in% features) %>%
+    dplyr::distinct(Feature, Species) %>%
+    dplyr::mutate(Species_clean = gsub("^[a-z]__", "", Species),
+                  Dataset = kingdom) %>%
+    dplyr::select(Dataset, Feature, Species_clean)
+}
+
+compute_shap_for_kingdom <- function(kingdom, refit, val_list, seed = 2026) {
+  model <- refit$model
+  trainX_sel <- refit$trainX_sel
+  baseline <- mean(pred_wrapper(model, trainX_sel))
+
+  out <- list()
+  for (cohort in names(val_list)) {
+    val_X_sel <- val_list[[cohort]]$X[, colnames(trainX_sel), drop = FALSE]
+
+    set.seed(seed)
+    shap_mat <- fastshap::explain(model, X = trainX_sel, newdata = val_X_sel,
+                                  pred_wrapper = pred_wrapper, nsim = SHAP_NSIM)
+    shap_df <- as.data.frame(shap_mat)
+    shap_df$SampleID <- rownames(val_X_sel)
+
+    actual_pred   <- pred_wrapper(model, val_X_sel)
+    reconstructed <- baseline + rowSums(shap_df %>% dplyr::select(-SampleID))
+    max_diff <- max(abs(reconstructed - actual_pred))
+    cat(sprintf("[SHAP check] %s / %s: max|reconstructed-actual| = %.4f across %d samples (nsim=%d)\n",
+               kingdom, cohort, max_diff, nrow(shap_df), SHAP_NSIM))
+    if (max_diff > 0.05)
+      warning(sprintf("[SHAP check] %s/%s: reconstruction error %.3f exceeds 0.05 -- consider raising SHAP_NSIM.",
+                      kingdom, cohort, max_diff))
+
+    abund_long <- val_X_sel %>% tibble::rownames_to_column("SampleID") %>%
+      tidyr::pivot_longer(-SampleID, names_to = "Feature", values_to = "Abundance") %>%
+      dplyr::group_by(Feature) %>%
+      dplyr::mutate(Abundance_scaled = if (diff(range(Abundance)) > 0)
+                      (Abundance - min(Abundance)) / (max(Abundance) - min(Abundance)) else 0.5) %>%
+      dplyr::ungroup()
+
+    shap_long <- shap_df %>%
+      tidyr::pivot_longer(-SampleID, names_to = "Feature", values_to = "SHAP") %>%
+      dplyr::mutate(Dataset = kingdom, Cohort = cohort) %>%
+      dplyr::left_join(abund_long, by = c("SampleID", "Feature"))
+
+    out[[cohort]] <- shap_long
+  }
+  list(baseline = baseline, shap_long = do.call(rbind, out))
+}
+
+shap_results <- list()
+for (kname in names(kingdoms)) {
+  ckpt_name <- sprintf("%s_shap_n20", kname)
+  shap_results[[kname]] <- run_or_load(ckpt_name, function() {
+    compute_shap_for_kingdom(kname, refit_models[[kname]], validation_lists[[kname]])
+  })
+}
+
+shap_raw_long <- do.call(rbind, lapply(shap_results, `[[`, "shap_long"))
+
+species_labels_all <- do.call(rbind, lapply(names(consensus_features_list), function(k)
+  build_species_labels(k, consensus_features_list[[k]])))
+
+shap_raw_long <- shap_raw_long %>% dplyr::left_join(species_labels_all, by = c("Dataset", "Feature"))
+#write.csv(shap_raw_long, file.path(perf_dir, "shap_raw_per_sample.csv"), row.names = FALSE)
+```
+
+```{r shap_beeswarm}
+plot_shap_beeswarm <- function(kingdom, shap_df, kingdom_label) {
+  cohort_levels <- c("China_Cohort", "Thai_Cohort", "Korea_Cohort")
+  plot_df <- shap_df %>%
+    dplyr::filter(Dataset == kingdom) %>%
+    dplyr::mutate(Cohort = factor(Cohort, levels = cohort_levels,
+                                  labels = c("China Cohort", "Thai Cohort", "Korea Cohort")))
+
+  feature_order <- plot_df %>% dplyr::group_by(Species_clean) %>%
+    dplyr::summarise(mean_abs = mean(abs(SHAP)), .groups = "drop") %>%
+    dplyr::arrange(mean_abs) %>% dplyr::pull(Species_clean)
+  plot_df$Species_clean <- factor(plot_df$Species_clean, levels = feature_order)
+
+  ggplot(plot_df, aes(x = SHAP, y = Species_clean, color = Abundance_scaled)) +
+    ggbeeswarm::geom_quasirandom(groupOnX = FALSE, size = 1, alpha = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+    scale_color_gradient(low = "#1e7eeb", high = "#d93827", breaks = c(0, 1), 
+                         labels = c("Low", "High"), name = "Feature\nvalue") +
+    facet_wrap(~ Cohort) +
+    labs(title = sprintf("SHAP summary -- %s", kingdom_label),
+        #subtitle = "Final model refit on full discovery data; explained on each external cohort",
+        x = "SHAP value (impact on predicted P(HCC))", y = NULL) +
+    theme_report +
+    theme(legend.position = "right", 
+          legend.title = element_text(size = 10),
+          legend.text = element_text(size=9),
+          strip.text = element_text(face = "bold", size = 11))
+}
+
+kingdom_labels <- c(bac = "Bacteria", fun = "Fungi", bacfun = "Bac + Fun")
+
+for (kname in names(kingdoms)) {
+  p_beeswarm <- plot_shap_beeswarm(kname, shap_raw_long, kingdom_labels[[kname]])
+  print(p_beeswarm)
+  ggsave(file.path(fig_dir, sprintf("SHAP_beeswarm_%s.png", kname)), 
+         p_beeswarm, width = 11, height = 6, dpi = 600)
+}
+
+# companion mean|SHAP| importance plot, all kingdoms
+shap_importance <- shap_raw_long %>%
+  dplyr::group_by(Dataset, Feature, Species_clean) %>%
+  dplyr::summarise(mean_abs_shap = mean(abs(SHAP)), .groups = "drop") %>%
+  dplyr::mutate(Dataset_disp = factor(Dataset, levels = c("bac", "fun", "bacfun"),
+                                      labels = c("Bacteria", "Fungi", "Bac + Fun")))
+
+p_shap_importance <- shap_importance %>%
+  ggplot(aes(x = reorder_within(Species_clean, mean_abs_shap, Dataset), y = mean_abs_shap)) +
+  geom_col(fill = "#0072B2") +
+  coord_flip() +
+  scale_x_reordered() +
+  facet_wrap(~ Dataset_disp, scales = "free_y") +
+  labs(title = "Mean |SHAP value| by feature -- Adaboost, N=20",
+       subtitle = "Averaged across all 3 external cohorts",
+       x = NULL, y = "Mean |SHAP value|") +
+  theme_report
+
+print(p_shap_importance)
+
+#ggsave(file.path(fig_dir, "SHAP_importance.png"), p_shap_importance, width = 11, height = 8, dpi = 600)
+#write.csv(shap_importance, file.path(perf_dir, "shap_importance_summary.csv"), row.names = FALSE)
+```
+
+```{r refit_performance}
+refit_performance <- list()
+for (kname in names(kingdoms)) {
+  refit <- refit_models[[kname]]
+  val_list <- validation_lists[[kname]]
+  for (cohort in names(val_list)) {
+    val_data <- val_list[[cohort]]
+    val_X_sel <- val_data$X[, colnames(refit$trainX_sel), drop = FALSE]
+    probs <- pred_wrapper(refit$model, val_X_sel)
+    preds <- predict(refit$model, newdata = val_X_sel)
+    cm <- confusionMatrix(preds, val_data$y, positive = "HCC")
+    roc_val <- roc(val_data$y, probs, quiet = TRUE, levels = rev(c("HCC", "CO")), direction = "<")
+    refit_performance[[length(refit_performance) + 1]] <- data.frame(
+      Dataset = kname, Cohort = cohort, AUC = as.numeric(roc_val$auc),
+      Acc = cm$overall[["Accuracy"]], Sens = cm$byClass[["Sensitivity"]], Spec = cm$byClass[["Specificity"]]
+    )
+  }
+}
+refit_performance <- do.call(rbind, refit_performance)
+cat("\n=== Refit final-model performance on external cohorts ===\n")
+print(as.data.frame(refit_performance))
+#write.csv(refit_performance, file.path(perf_dir, "refit_model_external_performance.csv"), row.names = FALSE)
+```
+
+# 13. Save
+```{r save_all}
+save(all_results, all_features, all_predictions, summary_final, feature_freq, mean_roc_df,
+     consensus_features_list, refit_performance, shap_raw_long, shap_importance,
+     file = file.path(perf_dir, "final_adaboost_n20_results.RData"))
+```
+
+
+
